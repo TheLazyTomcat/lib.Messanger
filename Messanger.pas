@@ -1,10 +1,13 @@
 unit Messanger;
 
+{$IFDEF FPC}
+  {$MODE Delphi}
+{$ENDIF}
+
 interface
 
 uses
   Windows, SysUtils, SyncObjs, AuxTypes, MemVector;
-
 
 type
   TMsgrWaitResult = (mwrNewMessage,mwrTimeout,mwrError);
@@ -76,8 +79,8 @@ type
     fBufferedMessages:  TMsgrMessageVector;
   protected
     procedure AddMessages(Messages: PMsgrMessage; Count: Integer); virtual;
-    constructor Create(EndpointID: TMsgrEndpointID; Messanger: TMessanger);
   public
+    constructor Create(EndpointID: TMsgrEndpointID; Messanger: TMessanger);
     destructor Destroy; override;
     Function WaitForNewMessage(TimeOut: DWORD): TMsgrWaitResult; virtual;
     procedure FetchMessages; virtual;
@@ -104,7 +107,7 @@ type
     procedure AddSlots(UpTo: Integer = -1); virtual;
   public
     constructor Create;
-    destructor Destroy; override; 
+    destructor Destroy; override;
     Function IDIsFree(EndpointID: TMsgrEndpointID): Boolean; virtual;
     Function CreateEndpoint: TMessangerEndpoint; overload; virtual;
     Function CreateEndpoint(EndpointID: TMsgrEndpointID): TMessangerEndpoint; overload; virtual;
@@ -122,6 +125,7 @@ uses
 
 Function GetTimeStamp: Int64;
 begin
+Result := 0;
 If not QueryPerformanceCounter(Result) then
   raise Exception.CreateFmt('GetTimeStamp: Cannot obtain time stamp (0x%.8x).',[GetLastError]);
 end;
@@ -208,14 +212,14 @@ Function TMsgrMessageVector.Add(Item: TMsgrMessage): Integer;
 begin
 Result := inherited Add(@Item);
 end;
-  
+
 //------------------------------------------------------------------------------
 
 procedure TMsgrMessageVector.Insert(Index: Integer; Item: TMsgrMessage);
 begin
 inherited Insert(Index,@Item);
 end;
- 
+
 //------------------------------------------------------------------------------
 
 Function TMsgrMessageVector.Remove(Item: TMsgrMessage): Integer;
@@ -243,8 +247,8 @@ finally
   fSynchronizer.Leave;
 end;
 end;
-   
-//------------------------------------------------------------------------------
+
+//==============================================================================
 
 constructor TMessangerEndpoint.Create(EndpointID: TMsgrEndpointID; Messanger: TMessanger);
 begin
@@ -259,7 +263,7 @@ fFetchedMessages := TMsgrMessageVector.Create;
 fBufferedMessages := TMsgrMessageVector.Create;
 end;
 
-//==============================================================================
+//------------------------------------------------------------------------------
 
 destructor TMessangerEndpoint.Destroy;
 begin
@@ -271,7 +275,7 @@ fMessageWaiter.Free;
 fSynchronizer.Free;
 inherited;
 end;
-  
+
 //------------------------------------------------------------------------------
 
 Function TMessangerEndpoint.WaitForNewMessage(TimeOut: DWORD): TMsgrWaitResult;
@@ -283,7 +287,7 @@ else
   Result := mwrError;
 end;
 end;
-  
+
 //------------------------------------------------------------------------------
 
 procedure TMessangerEndpoint.FetchMessages;
@@ -292,14 +296,14 @@ fSynchronizer.Enter;
 try
   fFetchedMessages.Append(fReceivedMessages);
   fReceivedMessages.Clear;
-  fMessageWaiter.ResetEvent;  
+  fMessageWaiter.ResetEvent;
 finally
   fSynchronizer.Leave;
 end;
 If fFetchedMessages.Count > 0 then
   fFetchedMessages.Sort;
 end;
-   
+
 //------------------------------------------------------------------------------
 
 Function TMessangerEndpoint.SendMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: Integer = MSGR_PRIORITY_NORMAL): Boolean;
@@ -308,7 +312,7 @@ If fAutoBuffSend then
   SendBufferedMessages;
 Result := fMessanger.SendMessage(BuildMessage(fEndpointID,TargetID,Priority,GetTimeStamp,P1,P2,P3,P4));
 end;
-    
+
 //------------------------------------------------------------------------------
 
 procedure TMessangerEndpoint.BufferMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: Integer = MSGR_PRIORITY_NORMAL);
@@ -318,7 +322,7 @@ If fBufferedMessages.Count > 0 then
     SendBufferedMessages;
 fBufferedMessages.Add(BuildMessage(fEndpointID,TargetID,Priority,GetTimeStamp,P1,P2,P3,P4));
 end;
-    
+
 //------------------------------------------------------------------------------
 
 procedure TMessangerEndpoint.SendBufferedMessages;
@@ -402,7 +406,8 @@ try
   If Message.Target = MSGR_BROADCAST then
     begin
       For i := Low(fEndpoints) to High(fEndpoints) do
-        fEndpoints[i].AddMessages(@Message,1);
+        If Assigned(fEndpoints[i]) then
+          fEndpoints[i].AddMessages(@Message,1);
       Result := True;
     end
   else
@@ -480,7 +485,7 @@ inherited Create;
 SetLength(fEndpoints,0);
 fSynchronizer := TMultiReadExclusiveWriteSynchronizer.Create;
 end;
-   
+
 //------------------------------------------------------------------------------
 
 destructor TMessanger.Destroy;
@@ -489,7 +494,7 @@ var
 begin
 For i := Low(fEndpoints) to High(fEndpoints) do
   FreeAndNil(fEndpoints[i]);
-SetLength(fEndpoints,0);  
+SetLength(fEndpoints,0);
 fSynchronizer.Free;
 inherited;
 end;

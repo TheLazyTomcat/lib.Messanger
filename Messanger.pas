@@ -11,9 +11,9 @@
 
   Small library for thread-safe intraprocess communication.
 
-  ©František Milt 2016-02-25
+  ©František Milt 2016-03-07
 
-  Version 1.0
+  Version 1.0.1
 
   Notes:
     - do not create instance of class TMessangerEndpoint directly by calling
@@ -240,7 +240,7 @@ end;
 Function TMsgrMessageVector.ItemCompare(Item1,Item2: Pointer): Integer;
 begin
 Result := TMsgrMessage(Item2^).Priority - TMsgrMessage(Item1^).Priority;
-If TMsgrMessage(Item2^).TimeStamp >= TMsgrMessage(Item1^).TimeStamp then
+If TMsgrMessage(Item2^).TimeStamp < TMsgrMessage(Item1^).TimeStamp then
   Inc(Result)
 else
   Dec(Result);

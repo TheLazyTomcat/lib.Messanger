@@ -152,9 +152,9 @@ type
     destructor Destroy; override;
     Function WaitForNewMessage(TimeOut: DWORD): TMsgrWaitResult; virtual;
     procedure FetchMessages; virtual;
-    Function SendMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: Integer = MSGR_PRIORITY_NORMAL): Boolean; overload; virtual;
+    Function SendMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean; overload; virtual;
     Function SendMessage(const Msg: TMsgrMessage): Boolean; overload; virtual;
-    procedure BufferMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: Integer = MSGR_PRIORITY_NORMAL); overload; virtual;
+    procedure BufferMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL); overload; virtual;
     procedure BufferMessage(const Msg: TMsgrMessage); overload; virtual;
     procedure SendBufferedMessages; virtual;
     Function TraverseMessages: Boolean; virtual;
@@ -200,13 +200,20 @@ type
     property EndpointCount: Integer read GetEndpointCount;
   end;
 
+{==============================================================================}
+{   Auxiliary functions - declaration                                          }
+{==============================================================================}
+
+Function GetTimeStamp: TMsgrTimeStamp;
+Function BuildMessage(Sender, Target: TMsgrEndpointID; Priority: TMsgrPriority; TimeStamp: TMsgrTimeStamp; P1,P2,P3,P4: TMsgrParam): TMsgrMessage;
+
 implementation
 
 {==============================================================================}
-{   Auxiliary functions                                                        }
+{   Auxiliary functions - implementation                                       }
 {==============================================================================}
 
-Function GetTimeStamp: Int64;
+Function GetTimeStamp: TMsgrTimeStamp;
 begin
 Result := 0;
 If not QueryPerformanceCounter(Result) then
@@ -215,17 +222,16 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function BuildMessage(Sender, Target: TMsgrEndpointID; Priority: Int32; TimeStamp: Int64;
-                      Parameter1, Parameter2, Parameter3, Parameter4: TMsgrParam): TMsgrMessage;
+Function BuildMessage(Sender, Target: TMsgrEndpointID; Priority: TMsgrPriority; TimeStamp: TMsgrTimeStamp; P1,P2,P3,P4: TMsgrParam): TMsgrMessage;
 begin
 Result.Sender := Sender;
 Result.Target := Target;
 Result.Priority := Priority;
 Result.TimeStamp := TimeStamp;
-Result.Parameter1 := Parameter1;
-Result.Parameter2 := Parameter2;
-Result.Parameter3 := Parameter3;
-Result.Parameter4 := Parameter4;
+Result.Parameter1 := P1;
+Result.Parameter2 := P2;
+Result.Parameter3 := P3;
+Result.Parameter4 := P4;
 end;
 
 
@@ -436,7 +442,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TMessangerEndpoint.SendMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: Integer = MSGR_PRIORITY_NORMAL): Boolean;
+Function TMessangerEndpoint.SendMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean;
 begin
 If fAutoBuffSend then
   SendBufferedMessages;
@@ -454,7 +460,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TMessangerEndpoint.BufferMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: Integer = MSGR_PRIORITY_NORMAL);
+procedure TMessangerEndpoint.BufferMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL);
 begin
 fBufferedMessages.Add(BuildMessage(fEndpointID,TargetID,Priority,GetTimeStamp,P1,P2,P3,P4));
 end;

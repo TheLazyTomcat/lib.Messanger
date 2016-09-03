@@ -11,9 +11,9 @@
 
   Small library for thread-safe intraprocess communication.
 
-  ©František Milt 2016-07-10
+  ©František Milt 2016-09-03
 
-  Version 1.1
+  Version 1.1.1
 
   Notes:
     - do not create instance of class TMessangerEndpoint directly by calling
@@ -36,7 +36,7 @@ unit Messanger;
 interface
 
 uses
-  Windows, SysUtils, SyncObjs, AuxTypes, MemVector;
+  Windows, SysUtils, Classes, SyncObjs, AuxTypes, MemVector;
 
 const
   EndpointsCapacity = 1024; // must be less than 65535
@@ -145,6 +145,7 @@ type
     fFetchedMessages:     TMsgrMessageVector;
     fBufferedMessages:    TMsgrBufferedMessagesVector;
     fOnMessageTraversing: TMessageTraversingEvent;
+    fOnDestroying:        TNotifyEvent;
   protected
     procedure AddMessages(Messages: PMsgrMessage; Count: Integer); virtual;
   public
@@ -162,7 +163,8 @@ type
     property EndpointID: TMsgrEndpointID read fEndpointID;
     property AutoBuffSend: Boolean read fAutoBuffSend write fAutoBuffSend;
     property Messages: TMsgrMessageVector read fFetchedMessages;
-    property OnMessageTraversing: TMessageTraversingEvent read fOnMessageTraversing write fOnMessageTraversing; 
+    property OnMessageTraversing: TMessageTraversingEvent read fOnMessageTraversing write fOnMessageTraversing;
+    property OnDestroying: TNotifyEvent read fOnDestroying write fOnDestroying;
   end;
 
 {==============================================================================}
@@ -404,6 +406,8 @@ end;
 destructor TMessangerEndpoint.Destroy;
 begin
 fMessanger.RemoveEndpoint(fEndpointID);
+If Assigned(fOnDestroying) then
+  fOnDestroying(Self);
 fBufferedMessages.Free;
 fFetchedMessages.Free;
 fReceivedMessages.Free;

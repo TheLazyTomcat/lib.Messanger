@@ -26,6 +26,10 @@
     - before freeing TMessanger instance, make sure all endpoints are freed from
       their respective threads
 
+  Dependencies:
+    AuxTypes  - github.com/ncs-sniper/Lib.AuxTypes
+    MemVector - github.com/ncs-sniper/Lib.MemVector
+
 ===============================================================================}
 unit Messanger;
 

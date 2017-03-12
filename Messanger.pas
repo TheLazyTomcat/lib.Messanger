@@ -11,24 +11,31 @@
 
   Small library for thread-safe intraprocess communication.
 
-  ©František Milt 2016-09-03
+  ©František Milt 2017-03-12
 
-  Version 1.1.1
+  Version 1.2
 
   Notes:
     - do not create instance of class TMessangerEndpoint directly by calling
-      its constructor, instead use method TMessanger.CreateEndpoint
+      its constructor, instead use method(s) TMessanger.CreateEndpoint
     - manage creation of all endpoints in one thread (a thread that is managing
       TMessanger instance) and then pass them to threads that needs them, do
       not create endpoints from other threads
     - on the other hand, free endpoints from threads that are using them, never
       free them from thread that is managing TMessanger instance
     - before freeing TMessanger instance, make sure all endpoints are freed from
-      their respective threads
+      their respective threads, otherwise an exception will be raised when
+      TMessanger instance is freed
+    - use synchronous messages only when really necessary, bulk of the
+      communication should be asynchronous
+    - do not send synchronous messages from event handlers - it is possible as
+      long as synchronous dispatch is not active (in that case, send function
+      will fail), but discouraged
 
   Dependencies:
-    AuxTypes  - github.com/ncs-sniper/Lib.AuxTypes
-    MemVector - github.com/ncs-sniper/Lib.MemVector
+    AuxTypes    - github.com/ncs-sniper/Lib.AuxTypes
+    MemVector   - github.com/ncs-sniper/Lib.MemVector
+    WinSyncObjs - github.com/ncs-sniper/Lib.WinSyncObjs
 
 ===============================================================================}
 unit Messanger;
@@ -40,18 +47,14 @@ unit Messanger;
 interface
 
 uses
-  Windows, SysUtils, Classes, SyncObjs, AuxTypes, MemVector;
-
-const
-  EndpointsCapacity = 1024; // must be less than 65535
+  Windows, SysUtils, Classes, AuxTypes, MemVector, WinSyncObjs;
 
 type
-  TMsgrWaitResult = (mwrNewMessage,mwrTimeout,mwrError);
-
   TMsgrEndpointID = UInt16;       PMsgrEndpointID = ^TMsgrEndpointID;
   TMsgrPriority   = Int32;        PMsgrPriority   = ^TMsgrPriority;
   TMsgrTimeStamp  = Int64;        PMsgrTimeStamp  = ^TMsgrTimeStamp;
   TMsgrParam      = PtrInt;       PMsgrParam      = ^TMsgrParam;
+  TMsgrOpaque     = Pointer;      PMsgrOpaque     = ^TMsgrOpaque;
 
   TMsgrMessage = packed record
     Sender:     TMsgrEndpointID;
@@ -62,6 +65,7 @@ type
     Parameter2: TMsgrParam;
     Parameter3: TMsgrParam;
     Parameter4: TMsgrParam;
+    Reserved:   TMsgrOpaque;
   end;
   PMsgrMessage = ^TMsgrMessage;
 
@@ -79,6 +83,9 @@ const
   MSGR_PRIORITY_VERY_HIGH     = TMsgrPriority(1000);
   MSGR_PRIORITY_EXTREME_HIGH  = TMsgrPriority(10000);
   MSGR_PRIORITY_ABSOLUTE      = TMsgrPriority(100000);
+
+  MSGR_PRIORITY_MIN = MSGR_PRIORITY_MINIMAL;
+  MSGR_PRIORITY_MAX = MSGR_PRIORITY_ABSOLUTE;
 
 {==============================================================================}
 {------------------------------------------------------------------------------}
@@ -119,7 +126,7 @@ type
 {   TMsgrBufferedMessagesVector - declaration                                  }
 {==============================================================================}
 
-  TMsgrBufferedMessagesVector = class(TMsgrMessageVector)
+  TMsgrBufferedMessageVector = class(TMsgrMessageVector)
   protected
     Function ItemCompare(Item1,Item2: Pointer): Integer; override;
   end;
@@ -134,44 +141,74 @@ type
 {   TMessangerEndpoint - declaration                                           }
 {==============================================================================}
 
-  TMessanger = class; // forward declaration
+  TMsgrDispatchFlags = (mdfRemoveMessage,mdfStopTraversing,mdfAutoCycle,
+                        mdfUndeliveredMessage,mdfBufferedMessage,
+                        mdfSynchronousMessage,mdfSynchronousDispatch);
 
-  TMessageEvent = procedure(Sender: TObject; Msg: TMsgrMessage) of object;
-  TMessageTraversingEvent = procedure(Sender: TObject; Msg: TMsgrMessage; var RemoveMessage,ContinueTraversing: Boolean) of object;
+  TMsgrDispatchFlagsSet = set of TMsgrDispatchFlags;
+
+  TMsgrWaitResult = (mwrNewMessage,mwrTimeOut,mwrError);
+
+  TMsgrSyncMsgsWaiters = packed record
+    Outgoing: THandle;
+    Incoming: THandle;
+  end;
+
+  TMsgrMessageEvent = procedure(Sender: TObject; Msg: TMsgrMessage; var Flags: TMsgrDispatchFlagsSet) of object;
+
+  TMessanger = class; // forward declaration
 
   TMessangerEndpoint = class(TOBject)
   private
-    fEndpointID:          TMsgrEndpointID;
-    fMessanger:           TMessanger;
-    fAutoBuffSend:        Boolean;
-    fSynchronizer:        TCriticalSection;
-    fMessageWaiter:       TEvent;
-    fReceivedMessages:    TMsgrMessageVector;
-    fFetchedMessages:     TMsgrMessageVector;
-    fBufferedMessages:    TMsgrBufferedMessagesVector;
-    fUndeliveredMessages: TMsgrMessageVector;
-    fOnMessageTraversing: TMessageTraversingEvent;
-    fOnUndeliverableMsg:  TMessageEvent;
-    fOnDestroying:        TNotifyEvent;
+    fEndpointID:              TMsgrEndpointID;
+    fMessanger:               TMessanger;
+    fAutoBuffSend:            Boolean;
+    fAutoCycle:               Boolean;
+    fSynchronousDispatch:     Boolean;
+    // synchronizers
+    fIncomingSynchronizer:    TCriticalSection;     // protects vector of incoming messages
+    fIncomingMsgsWaiter:      TEvent;               // used for waiting for new incoming messages
+    fIncomingSyncMsgsWaiter:  TEvent;               // indicates incoming synchronous message
+    fOutgoingSyncMsgsWaiter:  TEvent;               // used for waiting on sent synchronous messages
+    fSyncMsgsWaiters:         TMsgrSyncMsgsWaiters; // for use in WaitForMultipleObjects
+    // vectors
+    fIncomingMessages:        TMsgrMessageVector;
+    fReceivedMessages:        TMsgrMessageVector;
+    fBufferedMessages:        TMsgrBufferedMessageVector;
+    fUndeliveredMessages:     TMsgrMessageVector;   // used to store undelivered buffered messages
+    // events
+    fOnMessageTraversing:     TMsgrMessageEvent;
+    fOnUndeliveredMessage:    TMsgrMessageEvent;
+    fOnDestroying:            TNotifyEvent;
+    Function GetMessageCount: Integer;
+    Function GetMessage(Index: Integer): TMsgrMessage;
   protected
-    procedure AddMessages(Messages: PMsgrMessage; Count: Integer); virtual;
+    procedure AddMessages(Messages: PMsgrMessage; Count: Integer); virtual; // called from other thread (sender)
+    procedure SynchronousDispatch; virtual;
+    procedure UndeliveredDispatch(Msg: TMsgrMessage; BufferedMessage: Boolean = False); virtual;
   public
     constructor Create(EndpointID: TMsgrEndpointID; Messanger: TMessanger);
     destructor Destroy; override;
+    Function SendMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean; overload; virtual;
+    Function SendMessage(Msg: TMsgrMessage): Boolean; overload; virtual;
+    Function SendMessageAndWait(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean; overload; virtual;
+    Function SendMessageAndWait(Msg: TMsgrMessage): Boolean; overload; virtual;
+    procedure BufferMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL); overload; virtual;
+    procedure BufferMessage(Msg: TMsgrMessage); overload; virtual;
+    procedure SendBufferedMessages; virtual;
     Function WaitForNewMessage(TimeOut: DWORD): TMsgrWaitResult; virtual;
     procedure FetchMessages; virtual;
-    Function SendMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean; overload; virtual;
-    Function SendMessage(const Msg: TMsgrMessage): Boolean; overload; virtual;
-    procedure BufferMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL); overload; virtual;
-    procedure BufferMessage(const Msg: TMsgrMessage); overload; virtual;
-    procedure SendBufferedMessages; virtual;
     Function TraverseMessages: Boolean; virtual;
+    procedure Cycle(MessageWaitTimeOut: DWORD); virtual;
+    procedure AutoCycle(MessageWaitTimeOut: DWORD); virtual;
+    procedure ClearMessages; virtual;
+    property Messages[Index: Integer]: TMsgrMessage read GetMessage;
   published
     property EndpointID: TMsgrEndpointID read fEndpointID;
     property AutoBuffSend: Boolean read fAutoBuffSend write fAutoBuffSend;
-    property Messages: TMsgrMessageVector read fFetchedMessages;
-    property OnMessageTraversing: TMessageTraversingEvent read fOnMessageTraversing write fOnMessageTraversing;
-    property OnUndeliverableMessage: TMessageEvent read fOnUndeliverableMsg write fOnUndeliverableMsg;
+    property MessageCount: Integer read GetMessageCount;
+    property OnMessageTraversing: TMsgrMessageEvent read fOnMessageTraversing write fOnMessageTraversing;
+    property OnUndeliveredMessage: TMsgrMessageEvent read fOnUndeliveredMessage write fOnUndeliveredMessage;
     property OnDestroying: TNotifyEvent read fOnDestroying write fOnDestroying;
   end;
 
@@ -185,7 +222,7 @@ type
 {   TMessanger - declaration                                                   }
 {==============================================================================}
 
-  TMsgrEndpoints = array[0..Pred(EndpointsCapacity)] of TMessangerEndpoint;
+  TMsgrEndpoints = array of TMessangerEndpoint;
 
   TMessanger = class(TObject)
   private
@@ -199,9 +236,9 @@ type
     Function SendMessage(Msg: TMsgrMessage): Boolean; virtual;
     procedure SendBufferedMessages(Messages,Undelivered: TMsgrMessageVector); virtual;
   public
-    constructor Create;
+    constructor Create(EndpointCapacity: TMsgrEndpointID = 1024);
     destructor Destroy; override;
-    Function IDIsFree(EndpointID: TMsgrEndpointID): Boolean; virtual;
+    Function IDAvailable(EndpointID: TMsgrEndpointID): Boolean; virtual;
     Function CreateEndpoint: TMessangerEndpoint; overload; virtual;
     Function CreateEndpoint(EndpointID: TMsgrEndpointID): TMessangerEndpoint; overload; virtual;
     property Endpoints[Index: Integer]: TMessangerEndpoint read GetEndpoint;
@@ -242,8 +279,8 @@ Result.Parameter1 := P1;
 Result.Parameter2 := P2;
 Result.Parameter3 := P3;
 Result.Parameter4 := P4;
+Result.Reserved := nil;
 end;
-
 
 {==============================================================================}
 {------------------------------------------------------------------------------}
@@ -274,12 +311,26 @@ end;
 //------------------------------------------------------------------------------
 
 Function TMsgrMessageVector.ItemCompare(Item1,Item2: Pointer): Integer;
+var
+  AssignMask: Byte;
 begin
-Result := TMsgrMessage(Item2^).Priority - TMsgrMessage(Item1^).Priority;
-If TMsgrMessage(Item2^).TimeStamp < TMsgrMessage(Item1^).TimeStamp then
-  Inc(Result)
+If Assigned(TMsgrMessage(Item1^).Reserved) then
+  AssignMask := 1
 else
-  Dec(Result);
+  AssignMask := 0;
+If Assigned(TMsgrMessage(Item2^).Reserved) then
+  AssignMask := AssignMask or 2;
+case AssignMask of
+  1:  Result := -1; // first is assigned, second is not => change order
+  2:  Result := +1; // first in not assigned, second is => keep order
+else
+ {0,3} // both are assigned or not assigned, decide upon other parameters
+  Result := TMsgrMessage(Item2^).Priority - TMsgrMessage(Item1^).Priority;
+  If TMsgrMessage(Item2^).TimeStamp < TMsgrMessage(Item1^).TimeStamp then
+    Inc(Result)
+  else
+    Dec(Result);
+end;
 end;
 
 {------------------------------------------------------------------------------}
@@ -362,7 +413,7 @@ end;
 {   TMsgrBufferedMessagesVector - protected methods                            }
 {------------------------------------------------------------------------------}
 
-Function TMsgrBufferedMessagesVector.ItemCompare(Item1,Item2: Pointer): Integer;
+Function TMsgrBufferedMessageVector.ItemCompare(Item1,Item2: Pointer): Integer;
 begin
 Result := TMsgrMessage(Item2^).Target - TMsgrMessage(Item1^).Target;
 end;
@@ -378,18 +429,88 @@ end;
 {==============================================================================}
 
 {------------------------------------------------------------------------------}
+{   TMessangerEndpoint - pivate methods                                        }
+{------------------------------------------------------------------------------}
+
+Function TMessangerEndpoint.GetMessageCount: Integer;
+begin
+Result := fReceivedMessages.Count;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMessangerEndpoint.GetMessage(Index: Integer): TMsgrMessage;
+begin
+If (Index >= fReceivedMessages.LowIndex) and (Index <= fReceivedMessages.HighIndex) then
+  Result := fReceivedMessages[Index]
+else
+  raise Exception.CreateFmt('TMessangerEndpoint.GetMessage: Index (%d) out of bounds.',[Index]);
+end;
+
+{------------------------------------------------------------------------------}
 {   TMessangerEndpoint - protected methods                                     }
 {------------------------------------------------------------------------------}
 
 procedure TMessangerEndpoint.AddMessages(Messages: PMsgrMessage; Count: Integer);
 begin
-fSynchronizer.Enter;
+fIncomingSynchronizer.Enter;
 try
-  fReceivedMessages.Append(Messages,Count);
-  fMessageWaiter.SetEvent;
+  fIncomingMessages.Append(Messages,Count);
+  fIncomingMsgsWaiter.SetEvent;
+  If (Count = 1) and Assigned(Messages^.Reserved) then
+    fIncomingSyncMsgsWaiter.SetEvent;
 finally
-  fSynchronizer.Leave;
+  fIncomingSynchronizer.Leave;
 end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMessangerEndpoint.SynchronousDispatch;
+var
+  i:      Integer;
+  Flags:  TMsgrDispatchFlagsSet;
+begin
+fSynchronousDispatch := True;
+try
+  FetchMessages;
+  For i := fReceivedMessages.HighIndex downto fReceivedMessages.LowIndex do
+    If Assigned(fReceivedMessages[i].Reserved) then
+      begin
+        // prepare flags
+        Flags := [mdfSynchronousMessage,mdfSynchronousDispatch];
+        If fAutoCycle then Include(Flags,mdfAutoCycle);
+        // call event
+        If Assigned(fOnMessageTraversing) then
+          fOnMessageTraversing(Self,fReceivedMessages[i],Flags);  // <<<
+        // process output flags
+        fAutoCycle := fAutoCycle and (mdfAutoCycle in Flags);
+        TEvent(fReceivedMessages[i].Reserved).SetEvent;
+        fReceivedMessages.Delete(i);
+      end;
+finally
+  fSynchronousDispatch := False;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMessangerEndpoint.UndeliveredDispatch(Msg: TMsgrMessage; BufferedMessage: Boolean = False);
+var
+  Flags:  TMsgrDispatchFlagsSet;
+begin
+If Assigned(fOnUndeliveredMessage) then
+  begin
+    // prepare flags
+    Flags := [mdfUndeliveredMessage];
+    If Assigned(Msg.Reserved) then Include(Flags,mdfSynchronousMessage);
+    If BufferedMessage then Include(Flags,mdfBufferedMessage);
+    If fAutoCycle then Include(Flags,mdfAutoCycle);
+    // call event
+    fOnUndeliveredMessage(Self,Msg,Flags);
+    // process output flags
+    fAutoCycle := fAutoCycle and (mdfAutoCycle in Flags);
+  end;
 end;
 
 {------------------------------------------------------------------------------}
@@ -402,11 +523,19 @@ inherited Create;
 fEndpointID := EndpointID;
 fMessanger := Messanger;
 fAutoBuffSend := False;
-fSynchronizer := TCriticalSection.Create;
-fMessageWaiter := TEvent.Create(nil,True,False,'');
+fAutoCycle := False;
+fSynchronousDispatch := False;
+// synchronizers
+fIncomingSynchronizer := TCriticalSection.Create;
+fIncomingMsgsWaiter := TEvent.Create(nil,False,False,'');
+fIncomingSyncMsgsWaiter := TEvent.Create(nil,False,False,'');
+fOutgoingSyncMsgsWaiter := TEvent.Create(nil,True,False,'');
+fSyncMsgsWaiters.Outgoing := fOutgoingSyncMsgsWaiter.Handle;
+fSyncMsgsWaiters.Incoming := fIncomingSyncMsgsWaiter.Handle;
+// vectors
+fIncomingMessages := TMsgrMessageVector.Create;
 fReceivedMessages := TMsgrMessageVector.Create;
-fFetchedMessages := TMsgrMessageVector.Create;
-fBufferedMessages := TMsgrBufferedMessagesVector.Create;
+fBufferedMessages := TMsgrBufferedMessageVector.Create;
 fUndeliveredMessages := TMsgrMessageVector.Create;
 end;
 
@@ -417,41 +546,19 @@ begin
 fMessanger.RemoveEndpoint(fEndpointID);
 If Assigned(fOnDestroying) then
   fOnDestroying(Self);
+FetchMessages;
+ClearMessages;
+// vectors
 fUndeliveredMessages.Free;
 fBufferedMessages.Free;
-fFetchedMessages.Free;
 fReceivedMessages.Free;
-fMessageWaiter.Free;
-fSynchronizer.Free;
+fIncomingMessages.Free;
+// synchronizers
+fOutgoingSyncMsgsWaiter.Free;
+fIncomingSyncMsgsWaiter.Free;
+fIncomingMsgsWaiter.Free;
+fIncomingSynchronizer.Free;
 inherited;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMessangerEndpoint.WaitForNewMessage(TimeOut: DWORD): TMsgrWaitResult;
-begin
-case fMessageWaiter.WaitFor(TimeOut) of
-  wrTimeOut:  Result := mwrTimeout;
-  wrSignaled: Result := mwrNewMessage;
-else
-  Result := mwrError;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TMessangerEndpoint.FetchMessages;
-begin
-fSynchronizer.Enter;
-try
-  fFetchedMessages.Append(fReceivedMessages);
-  fReceivedMessages.Clear;
-  fMessageWaiter.ResetEvent;
-finally
-  fSynchronizer.Leave;
-end;
-If fFetchedMessages.Count > 0 then
-  fFetchedMessages.Sort;
 end;
 
 //------------------------------------------------------------------------------
@@ -463,26 +570,65 @@ end;
 
 //   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
 
-Function TMessangerEndpoint.SendMessage(const Msg: TMsgrMessage): Boolean;
+Function TMessangerEndpoint.SendMessage(Msg: TMsgrMessage): Boolean;
 begin
 If fAutoBuffSend then
   SendBufferedMessages;
+Msg.Reserved := nil;
 Result := fMessanger.SendMessage(Msg);
-If not Result and Assigned(fOnUndeliverableMsg) then
-  fOnUndeliverableMsg(Self,Msg);
+If not Result then
+  UndeliveredDispatch(Msg);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMessangerEndpoint.SendMessageAndWait(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean;
+begin
+Result := SendMessageAndWait(BuildMessage(fEndpointID,TargetID,Priority,GetTimeStamp,P1,P2,P3,P4));
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMessangerEndpoint.SendMessageAndWait(Msg: TMsgrMessage): Boolean;
+var
+  ContinueWaiting:  Boolean;
+begin
+Result := False;
+If fAutoBuffSend then
+  SendBufferedMessages;
+If not fSynchronousDispatch and (Msg.Target <> MSGR_ID_BROADCAST) then
+  begin
+    Msg.Reserved := Pointer(fOutgoingSyncMsgsWaiter);
+    fOutgoingSyncMsgsWaiter.ResetEvent;
+    ContinueWaiting := True;
+    If fMessanger.SendMessage(Msg) then
+      while ContinueWaiting do
+        case WaitForMultipleObjects(2,Addr(fSyncMsgsWaiters),False,INFINITE) of
+              WAIT_OBJECT_0:  begin
+                                Result := True;
+                                ContinueWaiting := False;
+                              end;
+          WAIT_OBJECT_0 + 1:  SynchronousDispatch;
+        else
+          ContinueWaiting := False;
+        end
+  end;
+If not Result then
+  UndeliveredDispatch(Msg);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TMessangerEndpoint.BufferMessage(TargetID: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL);
 begin
-fBufferedMessages.Add(BuildMessage(fEndpointID,TargetID,Priority,GetTimeStamp,P1,P2,P3,P4));
+BufferMessage(BuildMessage(fEndpointID,TargetID,Priority,GetTimeStamp,P1,P2,P3,P4));
 end;
 
 //   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
 
-procedure TMessangerEndpoint.BufferMessage(const Msg: TMsgrMessage);
+procedure TMessangerEndpoint.BufferMessage(Msg: TMsgrMessage);
 begin
+Msg.Reserved := nil;
 fBufferedMessages.Add(Msg);
 end;
 
@@ -498,38 +644,106 @@ If fBufferedMessages.Count > 0 then
     fMessanger.SendBufferedMessages(fBufferedMessages,fUndeliveredMessages);
     fBufferedMessages.Clear;
   end;
-If Assigned(fOnUndeliverableMsg) and (fUndeliveredMessages.Count > 0) then
-  begin
-    For i := fUndeliveredMessages.LowIndex to fUndeliveredMessages.HighIndex do
-      fOnUndeliverableMsg(Self,fUndeliveredMessages[i]);
-    fUndeliveredMessages.Clear;  
-  end;
+For i := fUndeliveredMessages.LowIndex to fUndeliveredMessages.HighIndex do
+  UndeliveredDispatch(fUndeliveredMessages[i],True);
+fUndeliveredMessages.Clear;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMessangerEndpoint.WaitForNewMessage(TimeOut: DWORD): TMsgrWaitResult;
+begin
+case fIncomingMsgsWaiter.WaitFor(TimeOut) of
+  wrTimeOut:  Result := mwrTimeOut;
+  wrSignaled: Result := mwrNewMessage;
+else
+  Result := mwrError;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMessangerEndpoint.FetchMessages;
+begin
+fIncomingSynchronizer.Enter;
+try
+  fReceivedMessages.Append(fIncomingMessages);
+  fIncomingMessages.Clear;
+finally
+  fIncomingSynchronizer.Leave;
+end;
+fReceivedMessages.Sort;
 end;
 
 //------------------------------------------------------------------------------
 
 Function TMessangerEndpoint.TraverseMessages: Boolean;
 var
-  i:                  Integer;
-  RemoveMessage:      Boolean;
-  ContinueTraversing: Boolean;
+  i:      Integer;
+  Flags:  TMsgrDispatchFlagsSet;
 begin
 Result := True;
 If Assigned(fOnMessageTraversing) then
-  For i := fFetchedMessages.HighIndex downto fFetchedMessages.LowIndex do
-    begin
-      RemoveMessage := True;
-      ContinueTraversing := True;
-      fOnMessageTraversing(Self,fFetchedMessages[i],RemoveMessage,ContinueTraversing);
-      If RemoveMessage then
-        fFetchedMessages.Delete(i);
-      If not ContinueTraversing then
-        begin
-          Result := False;
-          Break{i};
-        end;
-    end
-else Result := False;
+  begin
+    For i := fReceivedMessages.HighIndex downto fReceivedMessages.LowIndex do
+      begin
+        // prepare flags
+        Flags := [mdfRemoveMessage];
+        If Assigned(fReceivedMessages[i].Reserved) then Include(Flags,mdfSynchronousMessage);
+        If fAutoCycle then Include(Flags,mdfAutoCycle);
+        // call event
+        fOnMessageTraversing(Self,fReceivedMessages[i],Flags);  // <<<
+        // process output flags
+        fAutoCycle := fAutoCycle and (mdfAutoCycle in Flags);
+        If mdfRemoveMessage in Flags then
+          begin
+            If Assigned(fReceivedMessages[i].Reserved) then
+              TEvent(fReceivedMessages[i].Reserved).SetEvent;
+            fReceivedMessages.Delete(i);
+          end;
+        If mdfStopTraversing in Flags then
+          begin
+            Result := False;
+            Break{i};
+          end;
+      end;
+  end
+else ClearMessages;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMessangerEndpoint.Cycle(MessageWaitTimeOut: DWORD);
+begin
+If WaitForNewMessage(MessageWaitTimeOut) = mwrNewMessage then
+  begin
+    FetchMessages;
+    TraverseMessages;
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMessangerEndpoint.AutoCycle(MessageWaitTimeOut: DWORD);
+begin
+If not fAutoCycle then
+  begin
+    fAutoCycle := True;
+    while fAutoCycle do
+      Cycle(MessageWaitTimeOut);
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMessangerEndpoint.ClearMessages;
+var
+  i:  Integer;
+begin
+For i := fReceivedMessages.LowIndex to fReceivedMessages.HighIndex do
+  If Assigned(fReceivedMessages[i].Reserved) then
+    TEvent(fReceivedMessages[i].Reserved).SetEvent;
+fReceivedMessages.Clear;
 end;
 
 {==============================================================================}
@@ -693,28 +907,30 @@ end;
 {   TMessanger - public methods                                                }
 {------------------------------------------------------------------------------}
 
-constructor TMessanger.Create;
+constructor TMessanger.Create(EndpointCapacity: TMsgrEndpointID = 1024);
 begin
 inherited Create;
+// High(TMsgrEndpointID) = $FFFF(65535) is reserved for broadcast
+If EndpointCapacity < High(TMsgrEndpointID) then
+  SetLength(fEndpoints,EndpointCapacity)
+else
+  raise Exception.CreateFmt('TMessanger.Create: Required capacity (%d) is too high.',[EndpointCapacity]);
 fSynchronizer := TMultiReadExclusiveWriteSynchronizer.Create;
-FillChar(fEndpoints,SizeOf(TMsgrEndpoints),0);
 end;
 
 //------------------------------------------------------------------------------
 
 destructor TMessanger.Destroy;
-var
-  i:  Integer;
 begin
-For i := Low(fEndpoints) to High(fEndpoints) do
-  FreeAndNil(fEndpoints[i]);
+If EndpointCount > 0 then
+  raise Exception.Create('TMessanger.Destroy: Not all endpoints were freed.');
 fSynchronizer.Free;
 inherited;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMessanger.IDIsFree(EndpointID: TMsgrEndpointID): Boolean;
+Function TMessanger.IDAvailable(EndpointID: TMsgrEndpointID): Boolean;
 begin
 fSynchronizer.BeginRead;
 try

@@ -11,9 +11,9 @@
 
   Small library for thread-safe intraprocess communication.
 
-  ©František Milt 2017-03-12
+  ©František Milt 2017-03-24
 
-  Version 1.2
+  Version 1.2.1
 
   Notes:
     - do not create instance of class TMessangerEndpoint directly by calling
@@ -141,11 +141,11 @@ type
 {   TMessangerEndpoint - declaration                                           }
 {==============================================================================}
 
-  TMsgrDispatchFlags = (mdfRemoveMessage,mdfStopTraversing,mdfAutoCycle,
-                        mdfUndeliveredMessage,mdfBufferedMessage,
-                        mdfSynchronousMessage,mdfSynchronousDispatch);
+  TMsgrDispatchFlag = (mdfRemoveMessage,mdfStopTraversing,mdfAutoCycle,
+                       mdfUndeliveredMessage,mdfBufferedMessage,
+                       mdfSynchronousMessage,mdfSynchronousDispatch);
 
-  TMsgrDispatchFlagsSet = set of TMsgrDispatchFlags;
+  TMsgrDispatchFlags = set of TMsgrDispatchFlag;
 
   TMsgrWaitResult = (mwrNewMessage,mwrTimeOut,mwrError);
 
@@ -154,7 +154,7 @@ type
     Incoming: THandle;
   end;
 
-  TMsgrMessageEvent = procedure(Sender: TObject; Msg: TMsgrMessage; var Flags: TMsgrDispatchFlagsSet) of object;
+  TMsgrMessageEvent = procedure(Sender: TObject; Msg: TMsgrMessage; var Flags: TMsgrDispatchFlags) of object;
 
   TMessanger = class; // forward declaration
 
@@ -469,7 +469,7 @@ end;
 procedure TMessangerEndpoint.SynchronousDispatch;
 var
   i:      Integer;
-  Flags:  TMsgrDispatchFlagsSet;
+  Flags:  TMsgrDispatchFlags;
 begin
 fSynchronousDispatch := True;
 try
@@ -497,7 +497,7 @@ end;
 
 procedure TMessangerEndpoint.UndeliveredDispatch(Msg: TMsgrMessage; BufferedMessage: Boolean = False);
 var
-  Flags:  TMsgrDispatchFlagsSet;
+  Flags:  TMsgrDispatchFlags;
 begin
 If Assigned(fOnUndeliveredMessage) then
   begin
@@ -680,7 +680,7 @@ end;
 Function TMessangerEndpoint.TraverseMessages: Boolean;
 var
   i:      Integer;
-  Flags:  TMsgrDispatchFlagsSet;
+  Flags:  TMsgrDispatchFlags;
 begin
 Result := True;
 If Assigned(fOnMessageTraversing) then

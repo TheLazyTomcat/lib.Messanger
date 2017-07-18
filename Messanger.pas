@@ -36,6 +36,7 @@
     AuxTypes    - github.com/ncs-sniper/Lib.AuxTypes
     MemVector   - github.com/ncs-sniper/Lib.MemVector
     WinSyncObjs - github.com/ncs-sniper/Lib.WinSyncObjs
+    StrRect     - github.com/ncs-sniper/Lib.StrRect
 
 ===============================================================================}
 unit Messanger;
@@ -43,6 +44,8 @@ unit Messanger;
 {$IFDEF FPC}
   {$MODE Delphi}
 {$ENDIF}
+
+{$TYPEINFO ON}
 
 interface
 

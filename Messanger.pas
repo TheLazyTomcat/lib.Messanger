@@ -34,6 +34,7 @@
 
   Dependencies:
     AuxTypes    - github.com/ncs-sniper/Lib.AuxTypes
+    AuxClasses  - github.com/ncs-sniper/Lib.AuxClasses
     MemVector   - github.com/ncs-sniper/Lib.MemVector
     WinSyncObjs - github.com/ncs-sniper/Lib.WinSyncObjs
     StrRect     - github.com/ncs-sniper/Lib.StrRect
@@ -50,7 +51,7 @@ unit Messanger;
 interface
 
 uses
-  Windows, SysUtils, Classes, AuxTypes, MemVector, WinSyncObjs;
+  Windows, SysUtils, Classes, AuxTypes, AuxClasses, MemVector, WinSyncObjs;
 
 type
   TMsgrEndpointID = UInt16;       PMsgrEndpointID = ^TMsgrEndpointID;
@@ -161,7 +162,7 @@ type
 
   TMessanger = class; // forward declaration
 
-  TMessangerEndpoint = class(TOBject)
+  TMessangerEndpoint = class(TCustomObject)
   private
     fEndpointID:              TMsgrEndpointID;
     fMessanger:               TMessanger;
@@ -227,7 +228,7 @@ type
 
   TMsgrEndpoints = array of TMessangerEndpoint;
 
-  TMessanger = class(TObject)
+  TMessanger = class(TCustomObject)
   private
     fEndpoints:     TMsgrEndpoints;
     fSynchronizer:  TMultiReadExclusiveWriteSynchronizer;

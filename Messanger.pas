@@ -11,9 +11,9 @@
 
   Small library for thread-safe intraprocess communication.
 
-  ©František Milt 2018-09-20
+  ©František Milt 2018-10-22
 
-  Version 1.2.2
+  Version 1.2.3
 
   Notes:
     - do not create instance of class TMessangerEndpoint directly by calling
@@ -46,12 +46,11 @@ unit Messanger;
   {$MODE Delphi}
 {$ENDIF}
 
-{$TYPEINFO ON}
-
 interface
 
 uses
-  Windows, SysUtils, Classes, AuxTypes, AuxClasses, MemVector, WinSyncObjs;
+  Windows, SysUtils, Classes,
+  AuxTypes, AuxClasses, MemVector, WinSyncObjs;
 
 type
   TMsgrEndpointID = UInt16;       PMsgrEndpointID = ^TMsgrEndpointID;
@@ -207,7 +206,6 @@ type
     procedure AutoCycle(MessageWaitTimeOut: DWORD); virtual;
     procedure ClearMessages; virtual;
     property Messages[Index: Integer]: TMsgrMessage read GetMessage;
-  published
     property EndpointID: TMsgrEndpointID read fEndpointID;
     property AutoBuffSend: Boolean read fAutoBuffSend write fAutoBuffSend;
     property MessageCount: Integer read GetMessageCount;
@@ -246,7 +244,6 @@ type
     Function CreateEndpoint: TMessangerEndpoint; overload; virtual;
     Function CreateEndpoint(EndpointID: TMsgrEndpointID): TMessangerEndpoint; overload; virtual;
     property Endpoints[Index: Integer]: TMessangerEndpoint read GetEndpoint;
-  published
     property EndpointCapacity: Integer read GetEndpointCapacity;
     property EndpointCount: Integer read GetEndpointCount;
   end;

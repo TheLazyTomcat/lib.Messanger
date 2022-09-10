@@ -9,41 +9,98 @@
 
   Messanger
 
-  Small library for thread-safe intraprocess communication.
+    Small library for message-based intraprocess (ie. between threads of single
+    process) communication.
 
-  ©František Milt 2018-10-22
+    To use this library, create an instance of TMessanger class. This object
+    is managing all communication endpoints and their connections. It should be
+    created and completely managed only in one thread, do not access it in
+    other threads.
 
-  Version 1.2.3
+    For each thread that wants to communicate, create exactly one endpoint
+    instance (instance of class TMessangerEndpoint) - refrain from using more
+    than one endpoint in a single thread.
+    Do NOT create these endpoints directly, always use TMessanger instance and
+    its method CreateEndpoint to create the endpoint object - do this in the
+    thread that is managing the messanger. Then pass this object by whatever
+    means to the thread that will be using it.
 
-  Notes:
-    - do not create instance of class TMessangerEndpoint directly by calling
-      its constructor, instead use method(s) TMessanger.CreateEndpoint
-    - manage creation of all endpoints in one thread (a thread that is managing
-      TMessanger instance) and then pass them to threads that needs them, do
-      not create endpoints from other threads
-    - on the other hand, free endpoints from threads that are using them, never
-      free them from thread that is managing TMessanger instance
-    - before freeing TMessanger instance, make sure all endpoints are freed from
-      their respective threads, otherwise an exception will be raised when
-      TMessanger instance is freed
-    - use synchronous messages only when really necessary, bulk of the
-      communication should be asynchronous
-    - do not send synchronous messages from event handlers - it is possible as
-      long as synchronous dispatch is not active (in that case, send function
-      will fail), but discouraged
+    On the other hand, always free the endpoint from the thread that is using
+    it, do not pass it back to thread managing the messanger.
+
+      WARNING - all endpoint objects must be freed before you destroy the
+                messanger, otherwise an exception will be raised while freeing
+                the messanger instance.
+
+    To communicate, use methods of endpoints to do so. SendMessage for
+    synchronous sending, PostMessage for asynchronous sending and so on.
+    To receive messages, you have to call methods WaitForMessage,
+    FetchMessages, and DispatchMessages repeatedly - or call method Cycle to
+    do so in one call.
+    If you want to process the incoming messages, assign one of the OnMessage*
+    handlers - the endpoint will be dispatching all received messages to the
+    handler for processing.
+
+  Version 2.0 beta (2022-09-10)
+
+  Last change 2022-09-10
+
+  ©2016-2022 František Milt
+
+  Contacts:
+    František Milt: frantisek.milt@gmail.com
+
+  Support:
+    If you find this code useful, please consider supporting its author(s) by
+    making a small donation using the following link(s):
+
+      https://www.paypal.me/FMilt
+
+  Changelog:
+    For detailed changelog and history please refer to this git repository:
+
+      github.com/TheLazyTomcat/Lib.Messanger
 
   Dependencies:
-    AuxTypes    - github.com/ncs-sniper/Lib.AuxTypes
-    AuxClasses  - github.com/ncs-sniper/Lib.AuxClasses
-    MemVector   - github.com/ncs-sniper/Lib.MemVector
-    WinSyncObjs - github.com/ncs-sniper/Lib.WinSyncObjs
-    StrRect     - github.com/ncs-sniper/Lib.StrRect
+    AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+    AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
+    BitOps             - github.com/TheLazyTomcat/Lib.BitOps
+  * BitVector          - github.com/TheLazyTomcat/Lib.BitVector
+    CrossSyncObjs      - github.com/TheLazyTomcat/Lib.CrossSyncObjs  
+    HashBase           - github.com/TheLazyTomcat/Lib.HashBase
+    InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
+  * LinSyncObjs        - github.com/TheLazyTomcat/Lib.LinSyncObjs
+    ListSorters        - github.com/TheLazyTomcat/Lib.ListSorters
+    MemVector          - github.com/TheLazyTomcat/Lib.MemVector
+    NamedSharedItems   - github.com/TheLazyTomcat/Lib.NamedSharedItems
+    SHA1               - github.com/TheLazyTomcat/Lib.SHA1  
+    SharedMemoryStream - github.com/TheLazyTomcat/Lib.SharedMemoryStream    
+  * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
+  * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
+    StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
+    StrRect            - github.com/TheLazyTomcat/Lib.StrRect
+  * UInt64Utils        - github.com/TheLazyTomcat/Lib.UInt64Utils
+  * WinSyncObjs        - github.com/TheLazyTomcat/Lib.WinSyncObjs
+
+  Libraries UInt64Utils and WinSyncObjs are required only when compiling for
+  Windows OS.
+
+  Libraries BitVector, SimpleFutex and LinSyncObjs are required only when
+  compiling for Linux OS.
+
+  Library SimpleCPUID might not be required when compiling for Windows OS,
+  depending on defined symbols in InterlockedOps and BitOps libraries.
 
 ===============================================================================}
 unit Messanger;
-{$message 'write how to use it'}
+
+{$IF Defined(WINDOWS) or Defined(MSWINDOWS)}
+  {$DEFINE Windows}
+{$IFEND}
+
 {$IFDEF FPC}
   {$MODE ObjFPC}
+  {$MODESWITCH DuplicateLocals+}
 {$ENDIF}
 {$H+}
 
@@ -54,7 +111,7 @@ uses
   AuxTypes, AuxClasses, MemVector, CrossSyncObjs;
 
 {===============================================================================
-    Library specific exceptions
+    Library-specific exceptions
 ===============================================================================}
 type
   EMsgrException = class(Exception);
@@ -204,12 +261,14 @@ type
 ===============================================================================}
 type
 {
+  TMsgrDispatchFlag
+
   Dispatch flags are serving two purposes - on enter to the handler, they can
   contain flags the handler can use to discern details about the currently
   processed message and also about the state of the messanger endpoint.
-  Also, the handler can include or exclude some flags from the set - some flags
-  are checked after the handle returns, and their presence or absence is used
-  to control further dispatching or workings of the endpoint.
+  Secondly, the handler can include or exclude some flags from the set - some
+  flags are checked after the handle returns, and their presence or absence is
+  used to control further dispatching or workings of the endpoint.
 
   Individual flags can be in, out, or in-out in nature.
 
@@ -312,25 +371,43 @@ type
     Function MsgToMsgOut(Msg: TMsgrMessage): TMsgrMessageOut; virtual;
   public
   {
+    Create
+
     Do not call the constructor, use TMessanger instance to create a new
     endpoint object.
   }
     constructor Create(EndpointID: TMsgrEndpointID; Messanger: TObject);
+  {
+    Destroy
+
+    During the object destruction, it is possible that events/callbacks
+    OnMessage* and OnUndelivered* will be fired. It is to process messages
+    received from last dispatching and unposted buffered messages respectively.
+
+    Note that for both the SendBlocked is true.
+
+    After that, OnDestroying* event/callback is fired - if both are assigned,
+    then only the event will be called.
+  }
     destructor Destroy; override;
     // message sending methods
   {
+    SendMessage
+
     SendMessage will send the passed message and then waits - it will not
     return until the message has been processed by the recipient.
 
-    It will return true only when the message was received AND processed by the
-    recipient. So, in case the message was delivered, but not processed (eg.
-    because the recipient was destroyed), it will return false.
+    It will return true only when the message was received AND processed
+    (passed to message handler) by the recipient. So, in case the message was
+    delivered, but not processed (eg. because the recipient was destroyed),
+    it will return false.
 
-    The endpoint can receive and dispatch other sent messages (not posted ones).
-    This means that, while you are still waiting for the SendMessage to return,
-    the endpoint can and will call message handler.
+    The endpoint can still receive and dispatch other sent messages (but not
+    the posted ones).
+    This means that, while you are waiting for the SendMessage to return, the
+    endpoint can and will call message handler.
     It is to prevent a deadlock when the recipient responds by sending another
-    synchronous message back to the sender within its message dispatch.    
+    synchronous message back to the sender within its message dispatch.
 
     It is allowed to send another synchronous message from a message handler,
     but as this creates a complex recursion, it is limited - see SendLevel and
@@ -346,6 +423,8 @@ type
     Function SendMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean; overload; virtual;
     Function SendMessage(Msg: TMsgrMessageOut): Boolean; overload; virtual;
   {
+    PostMessage
+
     PostMessage adds the passed message to the recipient's incoming messages
     and immediately exits.
 
@@ -354,11 +433,13 @@ type
 
     If AutomaticBufferedSend is set to true and message sending is not blocked
     (see property SendBlocked), then all buffered messages are posted before
-    the actual posting is performed.    
+    the actual posting is performed.
   }
     Function PostMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean; overload; virtual;
     Function PostMessage(Msg: TMsgrMessageOut): Boolean; overload; virtual;
   {
+    BufferMessage
+
     BufferMessage merely adds the passed message to internal storage, preparing
     it for future posting.
 
@@ -372,40 +453,48 @@ type
     procedure BufferMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL); overload; virtual;
     procedure BufferMessage(Msg: TMsgrMessageOut); overload; virtual;
   {
+    PostBufferedMessages
+
     PostBufferedMessages posts all buffered messages at once to their respective
     recipients.
 
     If some of the messages cannot be delivered, they are passed at the end of
     the processing to the OnUndelivered* event/callback.
     If both OnUndeliveredCallback and OnUndeliveredEvent (equivalent to
-    OnUndelivered) then only the event is called. If none is assigned, then
-    the messages are dropped an deleted.
+    OnUndelivered) are assigned, then only the event is called. If none is
+    assigned, then the messages are dropped an deleted.
 
-    Note that while in OnUndelivered* handler, all message sending and posting
-    is blocked (property SendBlocked is true).
+    Note that while in the OnUndelivered* handler, all message sending and
+    posting is blocked (property SendBlocked is true).
   }
     procedure PostBufferedMessages; virtual;
     // operation methods
   {
+    WaitForMessage
+
     WaitForMessage waits until a new message is received, timeout elapses (you
     can use INFINITE constant for infinite wait) or an error occurs.
     Whichever happened is indicated by the result.
   }
     Function WaitForMessage(Timeout: UInt32): TMsgrWaitResult; virtual;
   {
-    FetchMessages copies incoming messages (those deposited to a shared location
+    FetchMessages
+
+    FetchMessages moves incoming messages (those deposited to a shared location
     by other endpoints) into local storage (received messages), where they can
     be accessed without the overhead of thread synchronization and locking.
   }
     procedure FetchMessages; virtual;
   {
+    DispatchMessages
+
     When any of OnMessage(Event) or OnMessageCallback is assigned, it will
     traverse all received messages, passing each of them to the handler for
     processing (this process is called dispatching).
 
     All sent messages are dispatched first, the posted right after them. They
     are dispatched in order of ther priority (from higher to lower) and time of
-    sending/posting (from olders to newest). Note that priority takes precedence
+    sending/posting (from oldest to newest). Note that priority takes precedence
     over the time.
 
     If both OnMessageEvent (which is equivalent to OnMessage) and
@@ -415,15 +504,19 @@ type
   }
     procedure DispatchMessages; virtual;
   {
-    ClearMessages deletes all received messags without dispatching them.
+    ClearMessages
+
+    Deletes all received messags without dispatching them.
 
     Note that senders waiting for sent messages to be processed will be
-    released be the messages will NOT be marked as processed, meaning the
+    released but the messages will NOT be marked as processed, meaning the
     respective SendMessage methods will return false.
   }
     procedure ClearMessages; virtual;
   {
-    Calling Cycle is equivalent to the following sequence:
+    Cycle
+
+    Calling this method is equivalent to the following sequence:
 
       If WaitForMessage(Timeout) = mwrMessage then
         begin
@@ -433,21 +526,110 @@ type
   }
     procedure Cycle(Timeout: UInt32); virtual;
   {
+    AutoCycle
+
+    By calling this method, the endpoint enters the autocycle. It sets
+    InAutoCycle property to true and then repeatedly calls method Cycle with
+    the provided timeout as long as the InAutoCycle is true.
+
+    The autocyle can be exited by calling BreakAutoCycle or by excluding
+    mdfAutoCycle from dispatch flags within any dispatch handler.
 
     If autocycle is already running when calling this method, it will do
     nothing and immediately returns.
   }
     procedure AutoCycle(Timeout: UInt32); virtual;
+  {
+    BreakAutoCycle
+
+    Sets InAutoCycle to false, effectively breaking out of the autocycle.
+
+    Note that the autocycle might not end immediately, depending on multiple
+    factors, mainly of depth of send recursion (see SendLevelMaximum and
+    SendLevel properties).
+  }
     procedure BreakAutoCycle; virtual;
     // properties
     property EndpointID: TMsgrEndpointID read fEndpointID;
+  {
+    AutomaticBufferedSend
+
+    When AutomaticBufferedSend is set to true, all buffered messages are
+    automatically posted whenever you send or post another message (before it).
+    When false, you have to explicitly call PostBufferedMessages method to post
+    buffered messages.
+
+    If SendBlocked is true, this automatic posting is blocked too.
+
+    By default enabled.
+  }
     property AutomaticBufferedSend: Boolean read fAutoBuffSend write fAutoBuffSend;
+  {
+    SendLevelMaximum
+
+    Maximum depth of send recursion, see property SendLevel for details.
+  }
     property SendLevelMaximum: Integer read fSendLevelMax write fSendLevelMax;
+  {
+    SendLevel
+
+    When you send a synchronous message (methods SendMessage), the endpoint
+    will, while waiting for the message to be processed, fetch and dispatch
+    any incoming synchronous (sent) messages.
+
+    This means that, while waiting for SendMessage to return, the endpoint can
+    and will call OnMessage* handler. It is possible to again call SendMessage
+    from this handler where this call can again result in dispatch and so on.
+
+    This creates somewhat complex indirect recursion - if unchecked, it can
+    lead to stack overflow and other problems.
+
+    To limit a posibility of problems, each SendMessage increments SendLevel
+    counter. When this counter is equal to or above SendLevelMaximum before
+    the increment, the call to SendMessage will fail (actual send is not even
+    attempted). This limits possible depth of recursion this process can go
+    into.
+
+    This counter is exposed so you can check whether SendMessage failing was
+    due to this protection or not (SendLevel < SendLevelMaximum means it was
+    not), and then act accordingly.
+  }
     property SendLevel: Integer read fSendLevel;
+  {
+    InAutoCycle
+
+    This property indicates whether the endpoint is running within the
+    autocycle or not.
+  }
     property InAutoCycle: Boolean read fAutoCycle;
+  {
+    SendBlocked
+
+    When true, all sending and posting is blocked. It affects all SendMessage,
+    PostMessage and also PostBufferedMessages methods. BufferMessage is not
+    affected.
+
+    The effect of blocking is that when you try to post/send a message, the
+    respective method will just exit and return false.
+
+    As for PostBufferedMessages - it will not technically fail, so all currently
+    buffered messages stay buffered and undelivered handlers are NOT called.
+  }
     property SendBlocked: Boolean read fSendBlocked;
+  {
+    MessageCount
+
+    Number of messages currently received - it does not include incoming but
+    not yet fetched messages.
+  }
     property MessageCount: Integer read GetMessageCount;
+  {
+    Messages
+
+    All received messages, both posted and sent.
+  }
     property Messages[Index: Integer]: TMsgrMessage read GetMessage;
+    // event/callback properties
     property OnMessageCallback: TMsgrMessageInCallback read fOnMessageCallback write fOnMessageCallback;
     property OnMessageEvent: TMsgrMessageInEvent read fOnMessageEvent write fOnMessageEvent;
     property OnMessage: TMsgrMessageInEvent read fOnMessageEvent write fOnMessageEvent;
@@ -484,7 +666,22 @@ type
   public
     constructor Create(EndpointCapacity: TMsgrEndpointID = 128);
     destructor Destroy; override;
+  {
+    IDAvailable
+
+    Returns true when endpoint with the given ID does not exist (ie. the ID is
+    not taken). False otherwise.
+  }
     Function IDAvailable(EndpointID: TMsgrEndpointID): Boolean; virtual;
+  {
+    CreateEndpoint
+
+    Creates new endpoint. First overload uses first unused ID.
+
+    Second overload will create new endpoint with exactly the ID given. If the
+    reaquested ID is not available (is out of allocated capacity or is already
+    taken), then an exception is raised.
+  }
     Function CreateEndpoint: TMessangerEndpoint; overload; virtual;
     Function CreateEndpoint(EndpointID: TMsgrEndpointID): TMessangerEndpoint; overload; virtual;
     // properties
@@ -502,7 +699,7 @@ Function BuildMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Prior
 implementation
 
 uses
-  Windows,
+  {$IFDEF Windows}Windows{$ELSE}BaseUnix, Linux{$ENDIF},
   InterlockedOps;
 
 {===============================================================================
@@ -510,12 +707,21 @@ uses
 ===============================================================================}
 
 Function GetTimestamp: TMsgrTimestamp;
+{$IFNDEF Windows}
+var
+  Time: TTimeSpec;
+begin
+If clock_gettime(CLOCK_MONOTONIC_RAW,@Time) = 0 then
+  Result := (Int64(Time.tv_sec) * 1000000000) + Time.tv_nsec
+else
+  raise EMsgrTimestampError.CreateFmt('GetTimestamp: Cannot obtain time stamp (%d).',[errno]);
+{$ELSE}
 begin
 Result := 0;
-If QueryPerformanceCounter(Result) then
-  Result := Result and $7FFFFFFFFFFFFFFF  // mask out sign bit
-else
+If not QueryPerformanceCounter(Result) then
   raise EMsgrTimestampError.CreateFmt('GetTimestamp: Cannot obtain time stamp (%d).',[GetLastError]);
+{$ENDIF}
+Result := Result and $7FFFFFFFFFFFFFFF; // mask out sign bit
 end;
 
 {===============================================================================
@@ -662,7 +868,7 @@ TempPtr := inherited Extract(@Item);
 If Assigned(TempPtr) then
   Result := TMsgrMessage(TempPtr^)
 else
-  FillChar(Result,SizeOf(Result),0);
+  FillChar(Addr(Result)^,SizeOf(Result),0);
 end;
 
 
@@ -694,7 +900,7 @@ end;
 --------------------------------------------------------------------------------
 ===============================================================================}
 const
-  MSGR_REACT_FLAG_MESSAGE = $00000001;
+//MSGR_REACT_FLAG_MESSAGE = $00000001;  // not used anywhere
 
   MSGR_REACT_FLAGBIT_MESSAGE = 0;
 
@@ -702,7 +908,7 @@ const
   MSGR_SEND_FLAG_PROCESSED = $00000002;
 
   MSGR_SEND_FLAGBIT_RELEASED  = 0;
-  MSGR_SEND_FLAGBIT_PROCESSED = 1;
+//MSGR_SEND_FLAGBIT_PROCESSED = 1;  // not used anywhere
 
   MSGR_SEND_LEVEL_MAX = 128;
 
@@ -1035,7 +1241,7 @@ begin
 Result := SendMessage(BuildMessage(Recipient,P1,P2,P3,P4,Priority));
 end;
 
-//------------------------------------------------------------------------------
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 Function TMessangerEndpoint.SendMessage(Msg: TMsgrMessageOut): Boolean;
 var

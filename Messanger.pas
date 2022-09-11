@@ -41,9 +41,9 @@
     handlers - the endpoint will be dispatching all received messages to the
     handler for processing.
 
-  Version 2.0 beta (2022-09-10)
+  Version 2.0 beta (2022-09-11)
 
-  Last change 2022-09-10
+  Last change 2022-09-11
 
   ©2016-2022 František Milt
 
@@ -85,7 +85,7 @@
   Libraries UInt64Utils and WinSyncObjs are required only when compiling for
   Windows OS.
 
-  Libraries BitVector, SimpleFutex and LinSyncObjs are required only when
+  Libraries BitVector, LinSyncObjs and SimpleFutex are required only when
   compiling for Linux OS.
 
   Library SimpleCPUID might not be required when compiling for Windows OS,
@@ -518,6 +518,8 @@ type
 
     Calling this method is equivalent to the following sequence:
 
+      FetchMessages;
+      DispatchMessages;
       If WaitForMessage(Timeout) = mwrMessage then
         begin
           FetchMessages;
@@ -691,8 +693,10 @@ type
   end;
 
 {===============================================================================
-    Public auxiliary functions - declaration
+    Auxiliary functions - declaration
 ===============================================================================}
+
+Function GetTimestamp: TMsgrTimestamp;
 
 Function BuildMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): TMsgrMessageOut;
 
@@ -703,7 +707,7 @@ uses
   InterlockedOps;
 
 {===============================================================================
-    Internal auxiliary functions
+    Auxiliary functions - implementation
 ===============================================================================}
 
 Function GetTimestamp: TMsgrTimestamp;
@@ -724,9 +728,7 @@ If not QueryPerformanceCounter(Result) then
 Result := Result and $7FFFFFFFFFFFFFFF; // mask out sign bit
 end;
 
-{===============================================================================
-    Public auxiliary functions - implementation
-===============================================================================}
+//------------------------------------------------------------------------------
 
 Function BuildMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): TMsgrMessageOut;
 begin
@@ -906,9 +908,11 @@ const
 
   MSGR_SEND_FLAG_RELEASED  = $00000001;
   MSGR_SEND_FLAG_PROCESSED = $00000002;
+  MSGR_SEND_FLAG_DONE      = $00000004;
 
   MSGR_SEND_FLAGBIT_RELEASED  = 0;
 //MSGR_SEND_FLAGBIT_PROCESSED = 1;  // not used anywhere
+  MSGR_SEND_FLAGBIT_DONE      = 2;
 
   MSGR_SEND_LEVEL_MAX = 128;
 
@@ -1010,6 +1014,7 @@ If Assigned(fOnMessageEvent) or Assigned(fOnMessageCallback) then
         // release sender
         InterlockedOr(PMsgrSendRecord(TempMsg.SendParam)^.Flags,MSGR_SEND_FLAG_RELEASED or MSGR_SEND_FLAG_PROCESSED);
         PMsgrSendRecord(TempMsg.SendParam)^.Event.Unlock;
+        InterlockedBitTestAndSet(PMsgrSendRecord(TempMsg.SendParam)^.Flags,MSGR_SEND_FLAGBIT_DONE);  
         // process output flags
         fAutoCycle := fAutoCycle and (mdfAutoCycle in Flags);
         If mdfStopDispatching in Flags then
@@ -1023,6 +1028,7 @@ else
       begin
         InterlockedBitTestAndSet(PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,MSGR_SEND_FLAGBIT_RELEASED);
         PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Event.Unlock;
+        InterlockedBitTestAndSet(PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,MSGR_SEND_FLAGBIT_DONE);
       end;
     fReceivedSentMessages.Clear;
   end;
@@ -1263,7 +1269,7 @@ If not fSendBlocked then
           If TMessanger(fMessanger).SendMessage(MsgOutToMsg(Msg,@SendRecord)) then
             repeat
               If not InterlockedBitTest(SendRecord.Flags,MSGR_SEND_FLAGBIT_RELEASED) then
-                fReactEvent.Wait(INFINITE);
+                fReactEvent.Wait(INFINITE);            
               If InterlockedBitTestAndReset(fReactFlags,MSGR_REACT_FLAGBIT_MESSAGE) then
                 begin
                   // some messages were received, dispatch the sent ones
@@ -1272,9 +1278,10 @@ If not fSendBlocked then
                 end;
               // look if the message was processed
               TempFlags := InterlockedLoad(SendRecord.Flags);
-              ExitWait := (TempFlags and MSGR_SEND_FLAG_RELEASED) <> 0;
-              Result := ExitWait and ((TempFlags and MSGR_SEND_FLAG_PROCESSED) <> 0);
+              ExitWait := ((TempFlags and MSGR_SEND_FLAG_RELEASED) <> 0) and ((TempFlags and MSGR_SEND_FLAG_DONE) <> 0);
+              Result := (TempFlags and MSGR_SEND_FLAG_PROCESSED) <> 0;
             until ExitWait;
+          SendRecord.Event := nil;
         finally
           Dec(fSendLevel);
         end;
@@ -1387,6 +1394,7 @@ For i := fReceivedSentMessages.HighIndex downto fReceivedSentMessages.LowIndex d
   begin
     InterlockedBitTestAndSet(PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,MSGR_SEND_FLAGBIT_RELEASED);
     PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Event.Unlock;
+    InterlockedBitTestAndSet(PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,MSGR_SEND_FLAGBIT_DONE);
   end;
 fReceivedSentMessages.Clear;
 fReceivedPostedMessages.Clear;
@@ -1396,6 +1404,8 @@ end;
 
 procedure TMessangerEndpoint.Cycle(Timeout: UInt32);
 begin
+FetchMessages;
+DispatchMessages;
 If WaitForMessage(Timeout) = mwrMessage then
   begin
     FetchMessages;
@@ -1541,7 +1551,7 @@ end;
 
 procedure TMessanger.PostBufferedMessages(Messages,Undelivered: TMsgrMessageVector);
 
-  Function SendMessages(Start,Count: Integer): Boolean;
+  Function PostMessages(Start,Count: Integer): Boolean;
   var
     i:  Integer;
   begin
@@ -1585,8 +1595,8 @@ If Messages.Count > 0 then
               Inc(Count)
             else
               Break{For i};
-          If not SendMessages(Start,Count) then
-            Undelivered.Assign(Messages.Pointers[Start],Count);
+          If not PostMessages(Start,Count) then
+            Undelivered.Append(Messages.Pointers[Start],Count);
           Start := Start + Count;
         end;
     finally

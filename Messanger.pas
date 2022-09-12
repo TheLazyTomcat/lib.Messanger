@@ -41,9 +41,9 @@
     handlers - the endpoint will be dispatching all received messages to the
     handler for processing.
 
-  Version 2.0 beta (2022-09-11)
+  Version 2.0 (2022-09-12)
 
-  Last change 2022-09-11
+  Last change 2022-09-12
 
   ©2016-2022 František Milt
 
@@ -256,6 +256,41 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                                   TMsgrWaiter
+--------------------------------------------------------------------------------
+===============================================================================}
+{
+  Class TMsgrWaiter is only for internal purposes.
+}
+type
+  TMsgrWaiterResult = (wtrMessage,wtrTimeout,wtrError,wtrSentMessage,
+                       wtrSendReleased,wtrSendProcessed);
+
+  TMsgrWaiterResults = set of TMsgrWaiterResult;
+
+{===============================================================================
+    TMsgrWaiter - class declaration
+===============================================================================}
+type
+  TMsgrWaiter = class(TObject)
+  protected
+    fInterlock: TCriticalSectionRTL;
+    fEvent:     TEvent;
+    fFlags:     UInt32;
+    procedure Initialize; virtual;
+    procedure Finalize; virtual;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure SentMessageReceived; virtual;
+    procedure PostedMessageReceived; virtual;
+    procedure ReleaseSendMessage(var LocalFlags: UInt32; Processed: Boolean); virtual;
+    Function WaitForMessage(Timeout: UInt32): TMsgrWaiterResult; virtual;
+    Function WaitForRelease(var LocalFlags: UInt32): TMsgrWaiterResults; virtual;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                TMessangerEndpoint
 --------------------------------------------------------------------------------
 ===============================================================================}
@@ -330,10 +365,9 @@ type
     fSendLevel:               Integer;
     fAutoCycle:               Boolean;
     fSendBlocked:             Boolean;
-    fReactFlags:              UInt32;
     // synchronizers
     fIncomingSynchronizer:    TCriticalSectionRTL;  // protects vector of incoming messages
-    fReactEvent:              TEvent;
+    fWaiter:                  TMsgrWaiter;
     // message storage vectors
     fIncomingSentMessages:    TMsgrMessageVector;
     fIncomingPostedMessages:  TMsgrMessageVector;
@@ -354,6 +388,8 @@ type
     // methods called from other (sender) threads
     procedure ReceiveSentMessages(Messages: PMsgrMessage; Count: Integer); virtual;
     procedure ReceivePostedMessages(Messages: PMsgrMessage; Count: Integer); virtual;
+    // message fetching
+    procedure SentMessagesFetch; virtual;
     // message dispatching
     procedure SentMessagesDispatch; virtual;
     procedure PostedMessagesDispatch; virtual;
@@ -703,8 +739,7 @@ Function BuildMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Prior
 implementation
 
 uses
-  {$IFDEF Windows}Windows{$ELSE}BaseUnix, Linux{$ENDIF},
-  InterlockedOps;
+  {$IFDEF Windows}Windows{$ELSE}BaseUnix, Linux{$ENDIF};
 
 {===============================================================================
     Auxiliary functions - implementation
@@ -898,28 +933,191 @@ end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                                   TMsgrWaiter
+--------------------------------------------------------------------------------
+===============================================================================}
+const
+  MSGR_FLAG_SENTMESSAGE   = $00000001;
+  MSGR_FLAG_POSTEDMESSAGE = $00000002;
+
+  MSGR_LOCALFLAG_RELEASED  = $00000001;
+  MSGR_LOCALFLAG_PROCESSED = $00000002;
+
+{===============================================================================
+    TMsgrWaiter - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TMsgrWaiter - protected methods
+-------------------------------------------------------------------------------}
+
+procedure TMsgrWaiter.Initialize;
+begin
+fInterlock := TCriticalSectionRTL.Create;
+fEvent := TEvent.Create(False,False);
+fFlags := 0;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMsgrWaiter.Finalize;
+begin
+fEvent.Free;
+fInterlock.Free;
+end;
+
+{-------------------------------------------------------------------------------
+    TMsgrWaiter - public methods
+-------------------------------------------------------------------------------}
+
+constructor TMsgrWaiter.Create;
+begin
+inherited Create;
+Initialize;
+end;
+
+//------------------------------------------------------------------------------
+
+destructor TMsgrWaiter.Destroy;
+begin
+Finalize;
+inherited;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMsgrWaiter.SentMessageReceived;
+begin
+fInterlock.Lock;
+try
+  fFlags := fFlags or MSGR_FLAG_SENTMESSAGE;
+  fEvent.Unlock; 
+finally
+  fInterlock.Unlock;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMsgrWaiter.PostedMessageReceived;
+begin
+fInterlock.Lock;
+try
+  fFlags := fFlags or MSGR_FLAG_POSTEDMESSAGE;
+  fEvent.Unlock;
+finally
+  fInterlock.Unlock;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TMsgrWaiter.ReleaseSendMessage(var LocalFlags: UInt32; Processed: Boolean);
+begin
+fInterlock.Lock;
+try
+  If Processed then
+    LocalFlags := LocalFlags or MSGR_LOCALFLAG_RELEASED or MSGR_LOCALFLAG_PROCESSED
+  else
+    LocalFlags := LocalFlags or MSGR_LOCALFLAG_RELEASED;
+  fEvent.Unlock;
+finally
+  fInterlock.Unlock;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMsgrWaiter.WaitForMessage(Timeout: UInt32): TMsgrWaiterResult;
+var
+  ExitWait: Boolean;
+
+  Function CheckMessages: Boolean;
+  begin
+    fInterlock.Lock;
+    try
+      If (fFlags and (MSGR_FLAG_SENTMESSAGE or MSGR_FLAG_POSTEDMESSAGE)) <> 0 then
+        begin
+          fFlags := fFlags and not(MSGR_FLAG_SENTMESSAGE or MSGR_FLAG_POSTEDMESSAGE);
+          Result := True;
+        end
+      else Result := False;
+    finally
+      fInterlock.Unlock;
+    end;
+  end;
+
+begin
+If not CheckMessages then
+  repeat
+    ExitWait := True;
+    Result := wtrMessage;
+    case fEvent.Wait(Timeout) of
+      wrSignaled: If not CheckMessages then
+                    ExitWait := False;
+      wrTimeout:  Result := wtrTimeout;
+    else
+      Result := wtrError;
+    end;
+  until ExitWait
+else Result := wtrMessage;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMsgrWaiter.WaitForRelease(var LocalFlags: UInt32): TMsgrWaiterResults;
+
+  Function CheckLocalFlags(var WaitResult: TMsgrWaiterResults): Boolean;
+  begin
+    Result := False;
+    If (LocalFlags and MSGR_LOCALFLAG_RELEASED) <> 0 then
+      begin
+        Include(WaitResult,wtrSendReleased);
+        Result := True;
+      end;
+    If (LocalFlags and MSGR_LOCALFLAG_PROCESSED) <> 0 then
+      Include(WaitResult,wtrSendProcessed);
+  end;
+
+var
+  Released: Boolean;
+begin
+Result := [];
+fInterlock.Lock;
+try
+  Released := CheckLocalFlags(Result);
+finally
+  fInterlock.Unlock;
+end;
+If not Released then
+  begin
+    fEvent.Wait(INFINITE);
+    fInterlock.Lock;
+    try
+      If (fFlags and MSGR_FLAG_SENTMESSAGE) <> 0 then
+        begin
+          Include(Result,wtrSentMessage);
+          fFlags := fFlags and not MSGR_FLAG_SENTMESSAGE;
+        end;
+      CheckLocalFlags(Result);
+    finally
+      fInterlock.Unlock;
+    end;
+  end;
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                TMessangerEndpoint
 --------------------------------------------------------------------------------
 ===============================================================================}
 const
-//MSGR_REACT_FLAG_MESSAGE = $00000001;  // not used anywhere
-
-  MSGR_REACT_FLAGBIT_MESSAGE = 0;
-
-  MSGR_SEND_FLAG_RELEASED  = $00000001;
-  MSGR_SEND_FLAG_PROCESSED = $00000002;
-  MSGR_SEND_FLAG_DONE      = $00000004;
-
-  MSGR_SEND_FLAGBIT_RELEASED  = 0;
-//MSGR_SEND_FLAGBIT_PROCESSED = 1;  // not used anywhere
-  MSGR_SEND_FLAGBIT_DONE      = 2;
-
   MSGR_SEND_LEVEL_MAX = 128;
 
 type
   TMsgrSendRecord = record
     Flags:  UInt32;
-    Event:  TEvent; // react event (this field should be a pointer)
+    Waiter: TMsgrWaiter;
   end;
   PMsgrSendRecord = ^TMsgrSendRecord;
 
@@ -958,8 +1156,7 @@ If Count > 0 then
     fIncomingSynchronizer.Lock;
     try
       fIncomingSentMessages.Append(Messages,Count);
-      InterlockedBitTestAndSet(fReactFlags,MSGR_REACT_FLAGBIT_MESSAGE);
-      fReactEvent.Unlock;
+      fWaiter.SentMessageReceived;
     finally
       fIncomingSynchronizer.Unlock;
     end;
@@ -975,14 +1172,27 @@ If Count > 0 then
     fIncomingSynchronizer.Lock;
     try
       fIncomingPostedMessages.Append(Messages,Count);
-      InterlockedBitTestAndSet(fReactFlags,MSGR_REACT_FLAGBIT_MESSAGE);
-      fReactEvent.Unlock;
+      fWaiter.PostedMessageReceived;
     finally
       fIncomingSynchronizer.Unlock;
     end;
   end;
 end;
 
+
+//------------------------------------------------------------------------------
+
+procedure TMessangerEndpoint.SentMessagesFetch;
+begin
+fIncomingSynchronizer.Lock;
+try
+  fReceivedSentMessages.Append(fIncomingSentMessages);
+  fIncomingSentMessages.Clear;
+finally
+  fIncomingSynchronizer.Unlock;
+end;
+fReceivedSentMessages.Sort;
+end;
 
 //------------------------------------------------------------------------------
 
@@ -1012,9 +1222,7 @@ If Assigned(fOnMessageEvent) or Assigned(fOnMessageCallback) then
         // call event
         DoMessage(MsgToMsgIn(TempMsg),Flags);
         // release sender
-        InterlockedOr(PMsgrSendRecord(TempMsg.SendParam)^.Flags,MSGR_SEND_FLAG_RELEASED or MSGR_SEND_FLAG_PROCESSED);
-        PMsgrSendRecord(TempMsg.SendParam)^.Event.Unlock;
-        InterlockedBitTestAndSet(PMsgrSendRecord(TempMsg.SendParam)^.Flags,MSGR_SEND_FLAGBIT_DONE);  
+        PMsgrSendRecord(TempMsg.SendParam)^.Waiter.ReleaseSendMessage(PMsgrSendRecord(TempMsg.SendParam)^.Flags,True);
         // process output flags
         fAutoCycle := fAutoCycle and (mdfAutoCycle in Flags);
         If mdfStopDispatching in Flags then
@@ -1025,11 +1233,8 @@ else
   begin
     // no handler assigned, release waiting senders and remove all messages
     For i := fReceivedSentMessages.HighIndex downto fReceivedSentMessages.LowIndex do
-      begin
-        InterlockedBitTestAndSet(PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,MSGR_SEND_FLAGBIT_RELEASED);
-        PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Event.Unlock;
-        InterlockedBitTestAndSet(PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,MSGR_SEND_FLAGBIT_DONE);
-      end;
+      PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Waiter.ReleaseSendMessage(
+        PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,False);
     fReceivedSentMessages.Clear;
   end;
 end;
@@ -1135,10 +1340,9 @@ fSendLevelMax := MSGR_SEND_LEVEL_MAX;
 fSendLevel := 0;
 fAutoCycle := False;
 fSendBlocked := False;
-fReactFlags := 0;
 // synchronizers
 fIncomingSynchronizer := TCriticalSectionRTL.Create;
-fReactEvent := TEvent.Create(False,False);
+fWaiter := TMsgrWaiter.Create;
 // message storage vectors
 fIncomingSentMessages := TMsgrMessageVector.Create;
 fIncomingPostedMessages := TMsgrMessageVector.Create;
@@ -1180,7 +1384,7 @@ fReceivedSentMessages.Free;
 fIncomingPostedMessages.Free;
 fIncomingSentMessages.Free;
 // free synchronizers
-fReactEvent.Free;
+fWaiter.Free;
 fIncomingSynchronizer.Free;
 end;
 
@@ -1251,9 +1455,9 @@ end;
 
 Function TMessangerEndpoint.SendMessage(Msg: TMsgrMessageOut): Boolean;
 var
-  SendRecord: TMsgrSendRecord;
-  ExitWait:   Boolean;
-  TempFlags:  UInt32;
+  SendRecord:   TMsgrSendRecord;
+  ExitWait:     Boolean;
+  WaiterResult: TMsgrWaiterResults;
 begin
 Result := False;
 If not fSendBlocked then
@@ -1265,23 +1469,20 @@ If not fSendBlocked then
         Inc(fSendLevel);
         try
           SendRecord.Flags := 0;
-          SendRecord.Event := fReactEvent;
+          SendRecord.Waiter := fWaiter;
           If TMessanger(fMessanger).SendMessage(MsgOutToMsg(Msg,@SendRecord)) then
             repeat
-              If not InterlockedBitTest(SendRecord.Flags,MSGR_SEND_FLAGBIT_RELEASED) then
-                fReactEvent.Wait(INFINITE);            
-              If InterlockedBitTestAndReset(fReactFlags,MSGR_REACT_FLAGBIT_MESSAGE) then
+              WaiterResult := fWaiter.WaitForRelease(SendRecord.Flags);
+              If wtrSentMessage in WaiterResult then
                 begin
                   // some messages were received, dispatch the sent ones
-                  FetchMessages;
+                  SentMessagesFetch;
                   SentMessagesDispatch;
                 end;
-              // look if the message was processed
-              TempFlags := InterlockedLoad(SendRecord.Flags);
-              ExitWait := ((TempFlags and MSGR_SEND_FLAG_RELEASED) <> 0) and ((TempFlags and MSGR_SEND_FLAG_DONE) <> 0);
-              Result := (TempFlags and MSGR_SEND_FLAG_PROCESSED) <> 0;
+              ExitWait := wtrSendReleased in WaiterResult;
+              Result := wtrSendProcessed in WaiterResult;
             until ExitWait;
-          SendRecord.Event := nil;
+          SendRecord.Waiter := nil;
         finally
           Dec(fSendLevel);
         end;
@@ -1342,20 +1543,13 @@ end;
 //------------------------------------------------------------------------------
 
 Function TMessangerEndpoint.WaitForMessage(Timeout: UInt32): TMsgrWaitResult;
-var
-  ExitWait: Boolean;
 begin
-repeat
-  ExitWait := True;
-  Result := mwrMessage;
-  case fReactEvent.Wait(Timeout) of
-    wrTimeout:  Result := mwrTimeout;
-    wrSignaled: If not InterlockedBitTestAndReset(fReactFlags,MSGR_REACT_FLAGBIT_MESSAGE) then
-                  ExitWait := False;
-  else
-    Result := mwrError;
-  end;
-until ExitWait;
+case fWaiter.WaitForMessage(Timeout) of
+  wtrMessage:  Result := mwrMessage;
+  wtrTimeout:  Result := mwrTimeout;
+else
+  Result := mwrError;
+end;
 end;
 
 //------------------------------------------------------------------------------
@@ -1391,11 +1585,8 @@ var
 begin
 // release waiting senders
 For i := fReceivedSentMessages.HighIndex downto fReceivedSentMessages.LowIndex do
-  begin
-    InterlockedBitTestAndSet(PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,MSGR_SEND_FLAGBIT_RELEASED);
-    PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Event.Unlock;
-    InterlockedBitTestAndSet(PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,MSGR_SEND_FLAGBIT_DONE);
-  end;
+  PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Waiter.ReleaseSendMessage(
+    PMsgrSendRecord(fReceivedSentMessages[i].SendParam)^.Flags,False);
 fReceivedSentMessages.Clear;
 fReceivedPostedMessages.Clear;
 end;

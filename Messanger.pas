@@ -43,7 +43,7 @@
 
   Version 2.0 (2022-09-12)
 
-  Last change 2022-09-12
+  Last change 2022-09-24
 
   ©2016-2022 František Milt
 
@@ -96,6 +96,10 @@ unit Messanger;
 
 {$IF Defined(WINDOWS) or Defined(MSWINDOWS)}
   {$DEFINE Windows}
+{$ELSEIF Defined(LINUX) and Defined(FPC)}
+  {$DEFINE Linux}
+{$ELSE}
+  {$MESSAGE FATAL 'Unsupported operating system.'}
 {$IFEND}
 
 {$IFDEF FPC}

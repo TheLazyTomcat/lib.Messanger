@@ -41,9 +41,9 @@
     handlers - the endpoint will be dispatching all received messages to the
     handler for processing.
 
-  Version 2.0 (2022-09-12)
+  Version 2.0.1 (2022-10-03)
 
-  Last change 2022-09-24
+  Last change 2022-10-03
 
   ©2016-2022 František Milt
 
@@ -769,6 +769,33 @@ end;
 
 //------------------------------------------------------------------------------
 
+Function GetElapsedMillis(StartTime: TMsgrTimestamp): UInt32;
+var
+  CurrentTime:  TMsgrTimestamp;
+  Temp:         Int64;
+begin
+CurrentTime := GetTimestamp;
+If CurrentTime >= StartTime then
+  begin
+  {$IFDEF Windows}
+    Temp := 1;
+    If QueryPerformanceFrequency(Temp) then
+      Temp := Trunc(((CurrentTime - StartTime) / Temp) * 1000)
+    else
+      raise EMsgrTimestampError.CreateFmt('GetElapsedMillis: Failed to obtain timer frequency (%d).',[GetLastError]);
+  {$ELSE}
+    Temp := (CurrentTime - StartTime) div 1000000;  // stamps are in ns, convert to ms
+  {$ENDIF}
+    If Temp < INFINITE then
+      Result := UInt32(Temp)
+    else
+      Result := INFINITE;
+  end
+else Result := INFINITE;
+end;
+
+//------------------------------------------------------------------------------
+
 Function BuildMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): TMsgrMessageOut;
 begin
 Result.Recipient := Recipient;
@@ -1033,7 +1060,10 @@ end;
 
 Function TMsgrWaiter.WaitForMessage(Timeout: UInt32): TMsgrWaiterResult;
 var
-  ExitWait: Boolean;
+  StartTime:        TMsgrTimestamp;
+  TimeoutRemaining: UInt32;
+  ElapsedMillis:    UInt32;
+  ExitWait:         Boolean;
 
   Function CheckMessages: Boolean;
   begin
@@ -1051,13 +1081,28 @@ var
   end;
 
 begin
+StartTime := GetTimestamp;
+TimeoutRemaining := Timeout;
 If not CheckMessages then
   repeat
     ExitWait := True;
     Result := wtrMessage;
-    case fEvent.Wait(Timeout) of
+    case fEvent.Wait(TimeoutRemaining) of
       wrSignaled: If not CheckMessages then
-                    ExitWait := False;
+                    begin
+                      // recalcualte timeout
+                      If Timeout <> INFINITE then
+                        begin
+                          ElapsedMillis := GetElapsedMillis(StartTime);
+                          If Timeout <= ElapsedMillis then
+                            begin
+                              Result := wtrTimeout;
+                              Break{repeat};
+                            end
+                          else TimeoutRemaining := Timeout - ElapsedMillis;
+                        end;
+                      ExitWait := False;
+                    end;
       wrTimeout:  Result := wtrTimeout;
     else
       Result := wtrError;

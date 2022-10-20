@@ -41,9 +41,9 @@
     handlers - the endpoint will be dispatching all received messages to the
     handler for processing.
 
-  Version 2.0.1 (2022-10-03)
+  Version 2.0.2 (2022-10-20)
 
-  Last change 2022-10-03
+  Last change 2022-10-20
 
   ©2016-2022 František Milt
 
@@ -111,7 +111,7 @@ unit Messanger;
 interface
 
 uses
-  SysUtils, Classes,
+  SysUtils, Classes,{$IFNDEF Windows} BaseUnix,{$ENDIF}
   AuxTypes, AuxClasses, MemVector, CrossSyncObjs;
 
 {===============================================================================
@@ -341,9 +341,12 @@ type
                                 removing this flag, handler can break the
                                 autocycle, note that adding this flag when it
                                 is not present will NOT activate the autocycle
+
+  mdfDirectDispatch (in)      - processed message was sent to this endpoint
+                                (ie. the sender is the same as recipient)                                 
 }
   TMsgrDispatchFlag = (mdfSentMessage,mdfUndeliveredMessage,mdfSendBlocked,
-                       mdfStopDispatching,mdfAutoCycle);
+                       mdfStopDispatching,mdfAutoCycle,mdfDirectDispatch);
 
   TMsgrDispatchFlags = set of TMsgrDispatchFlag;
 
@@ -361,6 +364,7 @@ type
 type
   TMessangerEndpoint = class(TCustomObject)
   protected
+    fWorkingThread:           {$IFDEF Windows}DWORD{$ELSE}pid_t{$ENDIF};
     fMessanger:               TObject;              // should be TMessanger class
     fEndpointID:              TMsgrEndpointID;
     fAutoBuffSend:            Boolean;
@@ -398,6 +402,7 @@ type
     procedure SentMessagesDispatch; virtual;
     procedure PostedMessagesDispatch; virtual;
     procedure UndeliveredDispatch; virtual;
+    Function DirectDispatch(Msg: TMsgrMessage): Boolean; virtual;
     // events firing
     procedure DoMessage(Msg: TMsgrMessageIn; var Flags: TMsgrDispatchFlags); virtual;
     procedure DoUndelivered(Msg: TMsgrMessageOut; var Flags: TMsgrDispatchFlags); virtual;
@@ -430,6 +435,14 @@ type
     then only the event will be called.
   }
     destructor Destroy; override;
+  {
+    ThreadInit
+
+    If you want to use more than one instance of TMessangerEndpoint in a single
+    thread, call this method as soon as possible at least once on all intances
+    within the context of the thread that will be using them.
+  }
+    procedure ThreadInit; virtual;
     // message sending methods
   {
     SendMessage
@@ -685,6 +698,9 @@ type
                                    TMessanger
 --------------------------------------------------------------------------------
 ===============================================================================}
+type
+  TMsgrSendResult = (msrFail,msrSent,msrReleased,msrProcessed);
+
 {===============================================================================
     TMessanger - class declaration
 ===============================================================================}
@@ -699,7 +715,7 @@ type
     Function GetEndpoint(Index: Integer): TMessangerEndpoint;
     // methods called from endpoint
     procedure RemoveEndpoint(EndpointID: TMsgrEndpointID); virtual;
-    Function SendMessage(Msg: TMsgrMessage): Boolean; virtual;
+    Function SendMessage(Msg: TMsgrMessage): TMsgrSendResult; virtual;
     Function PostMessage(Msg: TMsgrMessage): Boolean; virtual;
     procedure PostBufferedMessages(Messages,Undelivered: TMsgrMessageVector); virtual;
     // init, final
@@ -743,7 +759,7 @@ Function BuildMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Prior
 implementation
 
 uses
-  {$IFDEF Windows}Windows{$ELSE}BaseUnix, Linux{$ENDIF};
+  {$IFDEF Windows}Windows{$ELSE}Linux, SysCall{$ENDIF};
 
 {===============================================================================
     Auxiliary functions - implementation
@@ -805,6 +821,15 @@ Result.Parameter2 := P2;
 Result.Parameter3 := P3;
 Result.Parameter4 := P4;
 end;
+
+//------------------------------------------------------------------------------
+
+{$IFNDEF Windows}
+Function gettid: pid_t;
+begin
+Result := do_syscall(syscall_nr_gettid);
+end;
+{$ENDIF}
 
 
 {===============================================================================
@@ -1228,7 +1253,6 @@ If Count > 0 then
   end;
 end;
 
-
 //------------------------------------------------------------------------------
 
 procedure TMessangerEndpoint.SentMessagesFetch;
@@ -1349,6 +1373,29 @@ end;
 
 //------------------------------------------------------------------------------
 
+Function TMessangerEndpoint.DirectDispatch(Msg: TMsgrMessage): Boolean;
+var
+  Flags:  TMsgrDispatchFlags;
+begin
+If Assigned(fOnMessageEvent) or Assigned(fOnMessageCallback) then
+  begin
+    // prepare flags
+    Flags := [mdfSentMessage,mdfDirectDispatch];
+    If fAutoCycle then
+      Include(Flags,mdfAutoCycle);
+    If fSendBlocked then
+      Include(Flags,mdfSendBlocked);
+    // call event
+    DoMessage(MsgToMsgIn(Msg),Flags);
+    // process output flags
+    fAutoCycle := fAutoCycle and (mdfAutoCycle in Flags);
+    Result := True;
+  end
+else Result := False;
+end;
+
+//------------------------------------------------------------------------------
+
 procedure TMessangerEndpoint.DoMessage(Msg: TMsgrMessageIn; var Flags: TMsgrDispatchFlags);
 begin
 If Assigned(fOnMessageEvent) then
@@ -1381,6 +1428,7 @@ end;
 
 procedure TMessangerEndpoint.Initialize(EndpointID: TMsgrEndpointID; Messanger: TObject);
 begin
+fWorkingThread := 0;
 fMessanger := Messanger;
 fEndpointID := EndpointID;
 fAutoBuffSend := True;
@@ -1495,6 +1543,13 @@ end;
 
 //------------------------------------------------------------------------------
 
+procedure TMessangerEndpoint.ThreadInit;
+begin
+fWorkingThread := {$IFDEF Windows}GetCurrentThreadID{$ELSE}gettid{$ENDIF};
+end;
+
+//------------------------------------------------------------------------------
+
 Function TMessangerEndpoint.SendMessage(Recipient: TMsgrEndpointID; P1,P2,P3,P4: TMsgrParam; Priority: TMsgrPriority = MSGR_PRIORITY_NORMAL): Boolean;
 begin
 Result := SendMessage(BuildMessage(Recipient,P1,P2,P3,P4,Priority));
@@ -1517,21 +1572,31 @@ If not fSendBlocked then
       begin
         Inc(fSendLevel);
         try
-          SendRecord.Flags := 0;
-          SendRecord.Waiter := fWaiter;
-          If TMessanger(fMessanger).SendMessage(MsgOutToMsg(Msg,@SendRecord)) then
-            repeat
-              WaiterResult := fWaiter.WaitForRelease(SendRecord.Flags);
-              If wtrSentMessage in WaiterResult then
-                begin
-                  // some messages were received, dispatch the sent ones
-                  SentMessagesFetch;
-                  SentMessagesDispatch;
-                end;
-              ExitWait := wtrSendReleased in WaiterResult;
-              Result := wtrSendProcessed in WaiterResult;
-            until ExitWait;
-          SendRecord.Waiter := nil;
+          If Msg.Recipient <> fEndpointID then
+            begin
+              SendRecord.Flags := 0;
+              SendRecord.Waiter := fWaiter;
+              case TMessanger(fMessanger).SendMessage(MsgOutToMsg(Msg,@SendRecord)) of
+                msrSent:
+                  repeat
+                    WaiterResult := fWaiter.WaitForRelease(SendRecord.Flags);
+                    If wtrSentMessage in WaiterResult then
+                      begin
+                        // some messages were received, dispatch the sent ones
+                        SentMessagesFetch;
+                        SentMessagesDispatch;
+                      end;
+                    ExitWait := wtrSendReleased in WaiterResult;
+                    Result := wtrSendProcessed in WaiterResult;
+                  until ExitWait;
+                msrReleased:
+                  Result := False;
+                msrProcessed:
+                  Result := True;
+              end;
+              SendRecord.Waiter := nil;
+            end
+          else Result := DirectDispatch(MsgOutToMsg(Msg,nil));
         finally
           Dec(fSendLevel);
         end;
@@ -1739,16 +1804,27 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TMessanger.SendMessage(Msg: TMsgrMessage): Boolean;
+Function TMessanger.SendMessage(Msg: TMsgrMessage): TMsgrSendResult;
 begin
-Result := False;
+Result := msrFail;
 fSynchronizer.ReadLock;
 try
   If Msg.Recipient <= High(fEndpoints) then
     If Assigned(fEndpoints[Msg.Recipient]) then
       begin
-        fEndpoints[Msg.Recipient].ReceiveSentMessages(@Msg,1);
-        Result := True;
+        If (fEndpoints[Msg.Recipient].fWorkingThread = fEndpoints[Msg.Sender].fWorkingThread) and
+          (fEndpoints[Msg.Recipient].fWorkingThread <> 0) and (fEndpoints[Msg.Sender].fWorkingThread <> 0) then
+          begin
+            If fEndpoints[Msg.Recipient].DirectDispatch(Msg) then
+              Result := msrProcessed
+            else
+              Result := msrReleased;
+          end
+        else
+          begin
+            fEndpoints[Msg.Recipient].ReceiveSentMessages(@Msg,1);
+            Result := msrSent;
+          end;
       end;
 finally
   fSynchronizer.ReadUnlock;
